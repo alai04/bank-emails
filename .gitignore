@@ -5,9 +5,19 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
+
+# 运行时数据与日志（daemon 启动时自动创建）
+/data/
+/logs/
+
+# 真实凭据与本地配置，禁止入库
+.env
+.env.*
+!.env.example
 
 # 真实交易确认单样本（含客户名称、账号、成交金额，不纳入版本控制）
 /docs/examples/
