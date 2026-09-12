@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | v0.1（草案） |
+| 文档版本 | v0.2（草案） |
 | 状态 | 待评审 |
 | 日期 | 2026-09-12 |
 | 关联仓库 | `bank-emails` |
@@ -160,7 +160,7 @@ LLM 输出 `is_confirmation`（bool）、`issuer_type`（券商/银行/其他）
 
 ### FR-5 交易数据抽取
 
-对判定为确认单的邮件，按 §9 的字段清单与 §8.3 的 JSON Schema 抽取 1..N 笔交易。多笔交易、多币种、同日多笔需正确拆分。
+对判定为确认单的邮件，按 §9 的字段清单与 §8.3 的 JSON Schema 抽取 1..N 笔交易。多笔交易、多币种、同日多笔、同一封邮件内多份 advice 需正确拆分。抽取时还必须判定 `activity_type`（股票成交 / 定存滚存 / 现金收支 / 其它），因为样本中确实出现了证券与定存、现金流水混装在同一份文件里的情况（见附录 C.3）。
 
 **验收**：Golden Set 关键字段准确率 ≥ 98%；无法确定的字段必须返回 `null` 而不是猜测。
 
@@ -295,42 +295,101 @@ CREATE TABLE attachments (
     parse_error    TEXT
 );
 
--- 交易明细（一封邮件可多笔）
+-- 交易明细（一封邮件可含多份 advice、多笔成交、多个品种）
+-- 字段依据 docs/examples/ 下 12 份真实确认单整理，原始标签对照见附录 C。
 CREATE TABLE transactions (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    email_id          INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
-    seq               INTEGER NOT NULL,              -- 邮件内序号，从 1 开始
-    trade_date        TEXT,
-    settle_date       TEXT,
-    account_no        TEXT,
-    symbol            TEXT,
-    symbol_name       TEXT,
-    market            TEXT,
-    side              TEXT,                          -- BUY | SELL | OTHER
-    quantity          REAL,
-    price             REAL,
-    gross_amount      REAL,
-    fee               REAL,
-    tax               REAL,
-    net_amount        REAL,
-    currency          TEXT,
-    order_no          TEXT,
-    source_type       TEXT,                          -- body | attachment
-    source_ref        TEXT,                          -- 附件名或正文片段定位
-    confidence        REAL,
-    valid             INTEGER NOT NULL DEFAULT 0,
-    validation_errors TEXT,                          -- JSON 数组
-    external_ref      TEXT NOT NULL,
-    odoo_model        TEXT,
-    odoo_id           INTEGER,
-    push_status       TEXT NOT NULL DEFAULT 'PENDING',
-    push_error        TEXT,
-    created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL,
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    email_id               INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+    seq                    INTEGER NOT NULL,   -- 邮件内序号，从 1 开始
+
+    -- 单据属性
+    doc_type               TEXT,               -- CONFIRMATION | ADVICE | DELIVERY_STATEMENT | OTHER
+    activity_type          TEXT NOT NULL DEFAULT 'EQUITY_TRADE',
+                                               -- EQUITY_TRADE | DEPOSIT_ROLLOVER | CASH_MOVEMENT | OTHER
+    doc_version            TEXT,               -- 单据版本号，如 CASG1v1 / CAHK0v1
+    is_preliminary         INTEGER NOT NULL DEFAULT 0,  -- Maybank "Preliminary confirmation"
+    is_amendment           INTEGER NOT NULL DEFAULT 0,  -- 华泰香港 "This is a NEW confirmation"
+
+    -- 主体与账号
+    issuer_name            TEXT,               -- Maybank Securities / HSBC GPB / 华泰证券 ...
+    issuer_type            TEXT,               -- broker | bank | other
+    account_name           TEXT,               -- 账户名（IKARIA GROUP (HK) LIMITED ...）
+    account_no             TEXT,               -- 交易/资产账号
+    settlement_account_no  TEXT,               -- 资金/结算子账号
+    shareholder_account_no TEXT,               -- 股东账号（A 股交割单）
+    portfolio_no           TEXT,               -- SCB Customer Portfolio
+
+    -- 日期时间
+    trade_date             TEXT,               -- YYYY-MM-DD
+    trade_time             TEXT,               -- HH:MM:SS（原始时区）
+    trade_timezone         TEXT,               -- Asia/Hong_Kong / CET ...
+    trade_at_utc           TEXT,               -- ISO8601 UTC，便于排序与判重
+    settle_date            TEXT,               -- 交割日 / Value Date
+    exchange_rate          REAL,               -- 成交币种 → 结算币种
+
+    -- 标的
+    symbol                 TEXT,               -- 规范化证券代码
+    symbol_name            TEXT,               -- 规范化证券名称
+    symbol_name_raw        TEXT,               -- 原始名称（含代码后缀）
+    share_class            TEXT,               -- 'A' / H SHS / SHARES-H-
+    isin                   TEXT,
+    sedol                  TEXT,
+    broker_security_no     TEXT,               -- 券商内部证券编号（8018673-000 / 200149-000）
+    market                 TEXT,               -- HKEX / SSE / SZSE / BURSA ...
+    execution_venue        TEXT,               -- HONG KONG / SHENZHEN - HK STOCK CONNECT ...
+    trading_channel        TEXT,               -- STOCK_CONNECT | LOCAL
+
+    -- 数量与价格
+    side                   TEXT,               -- BUY | SELL | OTHER
+    side_raw               TEXT,               -- BOUGHT / SOLD / 买 / 卖出 ...
+    quantity               REAL,               -- 总成交数量
+    avg_price              REAL,               -- 成交均价
+    gross_amount           REAL,               -- 成交金额 / Consideration / Proceeds
+    fill_count             INTEGER,            -- 分价成交笔数
+    fill_detail_json       TEXT,               -- [{"quantity":4600,"price":19.16}, ...]
+
+    -- 费用：只单列跨机构最通用的项，其余名目进 fee_detail_json
+    commission             REAL,               -- 佣金 / Commission / Brokerage Fee
+    commission_rate        REAL,               -- SCB 给出的 "Rate of Commission (0.10 %)"
+    stamp_duty             REAL,               -- 印花税 / Stamp Duty
+    fees_total             REAL,               -- 全部费用合计
+    fee_detail_json        TEXT,               -- {"Clearing Fee":115.35,"过户费":99.21,...}
+
+    -- 金额与方向
+    trade_currency         TEXT,               -- 成交币种
+    settle_currency        TEXT,               -- 结算币种（与成交币种不同时）
+    net_amount             REAL,               -- 结算净额（成交币种，非负）
+    settlement_amount      REAL,               -- 结算金额（结算币种）
+    settlement_direction   TEXT,               -- DEBIT（付款）/ CREDIT（收款）
+    cash_amount_signed     REAL,               -- 带符号发生金额（华泰 A 股交割单）
+
+    -- 编号
+    broker_ref             TEXT,               -- 单笔确认单编号（REF. NO / Ref / Bargain Number）
+    statement_ref          TEXT,               -- 对账单/整份文件编号（Our Ref / Advice Reference）
+    order_no               TEXT,               -- 委托编号 / 成交编号
+    invoice_no             TEXT,               -- JPM "Tax Invoice No"
+
+    -- 溯源与状态
+    source_type            TEXT,               -- body | attachment
+    source_ref             TEXT,               -- 附件名#p3#row12 之类定位
+    confidence             REAL,
+    extra_json             TEXT,               -- 品种专属字段（如定存 maturity_date/interest_rate）
+    valid                  INTEGER NOT NULL DEFAULT 0,
+    validation_errors      TEXT,               -- JSON 数组
+    external_ref           TEXT NOT NULL,      -- 单据级幂等键（券商编号优先）
+    dedupe_key             TEXT NOT NULL,      -- 业务指纹（跨单据判重）
+    odoo_model             TEXT,
+    odoo_id                INTEGER,
+    push_status            TEXT NOT NULL DEFAULT 'PENDING',
+    push_error             TEXT,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
     UNIQUE (email_id, seq)
 );
 
-CREATE UNIQUE INDEX idx_tx_external_ref ON transactions(external_ref);
+CREATE UNIQUE INDEX idx_tx_dedupe_key ON transactions(dedupe_key);
+CREATE INDEX idx_tx_push_status ON transactions(push_status);
+CREATE INDEX idx_tx_symbol_date ON transactions(symbol, trade_date);
 
 -- 状态轨迹
 CREATE TABLE email_events (
@@ -365,7 +424,7 @@ CREATE TABLE runtime_state (
 );
 ```
 
-索引建议：`emails(status, next_retry_at)`、`emails(received_at)`、`transactions(push_status)`、`email_events(email_id)`。SQLite 开启 `journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=5000`。
+索引建议：`emails(status, next_retry_at)`、`emails(received_at)`、`transactions(dedupe_key)`（唯一）、`transactions(push_status)`、`transactions(symbol, trade_date)`、`email_events(email_id)`。SQLite 开启 `journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=5000`；金额列使用 `DECIMAL`/`TEXT` 存放精确小数，Python 侧用 `Decimal`，避免浮点累积误差。
 
 ---
 
@@ -393,39 +452,97 @@ CREATE TABLE runtime_state (
 ```json
 {
   "type": "object",
-  "required": ["transactions"],
+  "required": ["issuer_name", "transactions"],
   "properties": {
-    "issuer_name": { "type": ["string", "null"] },
+    "issuer_name": { "type": ["string", "null"], "description": "Maybank Securities Pte Ltd / HSBC Global Private Banking / 华泰证券 ..." },
     "issuer_type": { "type": ["string", "null"], "enum": ["broker", "bank", "other", null] },
-    "account_no": { "type": ["string", "null"] },
+    "account_name": { "type": ["string", "null"] },
+    "account_no": { "type": ["string", "null"], "description": "交易/资产账号，如 0114460、8088-620351-0001、10821237" },
+    "statement_ref": { "type": ["string", "null"], "description": "整份文件的编号，如 Our Ref BUC00686157" },
+    "doc_type": { "type": ["string", "null"], "enum": ["CONFIRMATION", "ADVICE", "DELIVERY_STATEMENT", "OTHER", null] },
+    "is_preliminary": { "type": ["boolean", "null"], "description": "单据标注 Preliminary / Subject to final contract 时为 true" },
     "transactions": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["symbol", "side", "quantity", "price", "trade_date", "currency", "confidence"],
+        "required": ["activity_type", "side", "trade_date", "trade_currency", "confidence"],
         "properties": {
-          "trade_date":   { "type": ["string", "null"], "description": "YYYY-MM-DD" },
-          "settle_date":  { "type": ["string", "null"] },
-          "symbol":       { "type": ["string", "null"] },
-          "symbol_name":  { "type": ["string", "null"] },
-          "market":       { "type": ["string", "null"] },
+          "activity_type":      { "type": "string", "enum": ["EQUITY_TRADE", "DEPOSIT_ROLLOVER", "CASH_MOVEMENT", "OTHER"] },
+          "is_amendment":       { "type": ["boolean", "null"] },
+          "doc_version":        { "type": ["string", "null"] },
+
+          "account_no":            { "type": ["string", "null"] },
+          "settlement_account_no": { "type": ["string", "null"] },
+          "shareholder_account_no": { "type": ["string", "null"] },
+          "portfolio_no":          { "type": ["string", "null"] },
+
+          "trade_date":     { "type": ["string", "null"], "description": "YYYY-MM-DD" },
+          "trade_time":     { "type": ["string", "null"], "description": "HH:MM:SS，原始时区" },
+          "trade_timezone": { "type": ["string", "null"], "description": "Asia/Hong_Kong、CET 等" },
+          "settle_date":    { "type": ["string", "null"], "description": "交割日 / Value Date" },
+
+          "symbol":             { "type": ["string", "null"], "description": "规范化代码，如 0700.HK、600887.SH" },
+          "symbol_name":        { "type": ["string", "null"], "description": "去掉代码后缀后的名称" },
+          "symbol_name_raw":    { "type": ["string", "null"], "description": "原文证券名称，如 CHINA PETROLEUM AND CHEMICAL CORP H SHS 386" },
+          "share_class":        { "type": ["string", "null"], "description": "'A' / H SHS / SHARES-H-" },
+          "isin":               { "type": ["string", "null"] },
+          "sedol":              { "type": ["string", "null"] },
+          "broker_security_no": { "type": ["string", "null"] },
+          "market":             { "type": ["string", "null"], "description": "HKEX / SSE / SZSE / BURSA" },
+          "execution_venue":    { "type": ["string", "null"], "description": "HONG KONG / SHENZHEN - HK STOCK CONNECT" },
+          "trading_channel":    { "type": ["string", "null"], "enum": ["STOCK_CONNECT", "LOCAL", null] },
+
           "side":         { "type": "string", "enum": ["BUY", "SELL", "OTHER"] },
-          "quantity":     { "type": ["number", "null"] },
-          "price":        { "type": ["number", "null"] },
-          "gross_amount": { "type": ["number", "null"] },
-          "fee":          { "type": ["number", "null"] },
-          "tax":          { "type": ["number", "null"] },
-          "net_amount":   { "type": ["number", "null"] },
-          "currency":     { "type": ["string", "null"] },
-          "order_no":     { "type": ["string", "null"] },
-          "confidence":   { "type": "number", "minimum": 0, "maximum": 1 }
+          "side_raw":     { "type": ["string", "null"], "description": "BOUGHT / SOLD / 买 / 卖出" },
+          "quantity":     { "type": ["number", "null"], "description": "总成交数量，恒为非负" },
+          "avg_price":    { "type": ["number", "null"], "description": "成交均价（分批成交时为加权均价）" },
+          "gross_amount": { "type": ["number", "null"], "description": "成交金额 / Consideration / Proceeds" },
+          "fill_detail":  {
+            "type": ["array", "null"],
+            "description": "分批成交明细（GF 等分价成交通知书）",
+            "items": {
+              "type": "object",
+              "required": ["quantity", "price"],
+              "properties": {
+                "quantity": { "type": "number" },
+                "price":    { "type": "number" }
+              }
+            }
+          },
+
+          "commission":      { "type": ["number", "null"] },
+          "commission_rate": { "type": ["number", "null"], "description": "小数形式，如 0.001 表示 0.10%" },
+          "stamp_duty":      { "type": ["number", "null"] },
+          "fees_total":      { "type": ["number", "null"], "description": "全部费用合计，恒为非负" },
+          "fee_detail": {
+            "type": ["object", "null"],
+            "description": "按单据原文名目保存的全部费用，键为原始标签",
+            "additionalProperties": { "type": "number" }
+          },
+
+          "trade_currency":       { "type": ["string", "null"], "description": "ISO 4217；CNH 与 CNY 需区分" },
+          "settle_currency":      { "type": ["string", "null"] },
+          "exchange_rate":        { "type": ["number", "null"] },
+          "net_amount":           { "type": ["number", "null"], "description": "结算净额（成交币种，非负）" },
+          "settlement_amount":    { "type": ["number", "null"], "description": "结算金额（结算币种）" },
+          "settlement_direction": { "type": ["string", "null"], "enum": ["DEBIT", "CREDIT", null] },
+          "cash_amount_signed":   { "type": ["number", "null"], "description": "带符号金额，买入为负（华泰 A 股）" },
+
+          "broker_ref": { "type": ["string", "null"] },
+          "order_no":   { "type": ["string", "null"] },
+          "invoice_no": { "type": ["string", "null"] },
+
+          "extra":      { "type": ["object", "null"], "description": "品种专属字段，如定存的 maturity_date / interest_rate / rolled_principal" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
         }
       }
     }
   }
 }
 ```
+
+说明：`symbol` 与 `quantity` 不再放进 `required`，因为交割单里的抛补/仓位调整行可能没有成交均价；让模型返回 `null` 并在 §9.3 校验阶段拦截，比逼它编造数值更安全。字段名与 §9.1 列名一致，仅三处 JSON 列在落库时加 `_json` 后缀：`fill_detail → fill_detail_json`、`fee_detail → fee_detail_json`、`extra → extra_json`。
 
 调用时优先使用供应商的结构化输出能力（如 `response_format: json_schema` 或 function calling）；若供应商不支持，则退化为"JSON 模式 + 本地 Schema 校验 + 一次修复重试"。
 
@@ -462,49 +579,83 @@ Microsoft Graph 的消息 `id` 在邮件被移动/复制后可能变化，不适
 
 ### 9.1 字段清单
 
-| 字段 | 类型 | 必填 | 说明 |
-| --- | --- | --- | --- |
-| trade_date | date | 是 | 成交日期 |
-| settle_date | date | 否 | 交割日期 |
-| account_no | string | 否 | 证券/银行账号（**脱敏存储与展示**） |
-| symbol | string | 是 | 股票代码 |
-| symbol_name | string | 否 | 股票名称 |
-| market | string | 否 | 交易所/市场（如 HKEX、NYSE、SSE） |
-| side | enum | 是 | BUY / SELL / OTHER |
-| quantity | number | 是 | 成交数量 |
-| price | number | 是 | 成交价 |
-| gross_amount | number | 否 | 成交金额（未扣费） |
-| fee | number | 否 | 佣金等费用合计 |
-| tax | number | 否 | 税费（如印花税） |
-| net_amount | number | 否 | 结算金额（含费） |
-| currency | string | 是 | ISO 4217，如 HKD/USD/CNY |
-| order_no | string | 否 | 订单号/成交编号/参考号 |
-| issuer_name | string | 否 | 券商或银行名称 |
-| confidence | number | 是 | 模型自评置信度 0–1 |
+字段清单按"哪些列始终有值"分三档：**核心**（推送 Odoo 必需）、**通用**（多数机构都有）、**扩展**（少数机构才有）。样本中未出现的字段一律不建列。
 
-> 说明：README 第 5 条列出的"结果中要包含的数据项"目前为空，本表为基于业务惯例的**建议默认集**，需与最终 Odoo 目标模型对齐后冻结（见 §18 Q1/Q2）。
+| 字段 | 类型 | 档次 | 说明 | 样本来源 |
+| --- | --- | --- | --- | --- |
+| activity_type | enum | 核心 | EQUITY_TRADE / DEPOSIT_ROLLOVER / CASH_MOVEMENT / OTHER | SCB（定存）、HSBC（现金账） |
+| trade_date | date | 核心 | 成交日期 | 全部 |
+| side | enum | 核心 | BUY / SELL / OTHER | 全部股票样本 |
+| quantity | number | 核心 | 总成交数量 | 全部 |
+| avg_price | number | 核心 | 成交均价（分批成交取加权均价） | 全部 |
+| gross_amount | number | 核心 | 成交金额 / Consideration / Proceeds | 全部 |
+| trade_currency | string | 核心 | 成交币种 ISO 4217 | 全部 |
+| net_amount | number | 核心 | 结算净额（成交币种） | 全部 |
+| confidence | number | 核心 | 模型自评置信度 0–1 | 全部 |
+| issuer_name / issuer_type | string/enum | 核心 | 机构名称与类型 | 全部 |
+| account_no / account_name | string | 通用 | 交易账号与户名（**脱敏存储与展示**） | 全部 |
+| settle_date | date | 通用 | 交割日 / Value Date | 全部 |
+| symbol / symbol_name | string | 通用 | 规范化代码与名称 | 全部股票样本 |
+| symbol_name_raw | string | 通用 | 原始名称（含代码后缀） | HSBC、SCB、华泰香港 |
+| side_raw | string | 通用 | BOUGHT / SOLD / 买 / 卖出 | 全部 |
+| fees_total | number | 通用 | 费用合计 | 全部 |
+| fee_detail_json | object | 通用 | 按原文名目保存全部费用 | 全部 |
+| commission / stamp_duty | number | 通用 | 佣金与印花税单列 | 除 SCB 外全部 |
+| settlement_direction | enum | 通用 | DEBIT / CREDIT | JPM、华泰 A 股、SCB |
+| broker_ref | string | 通用 | 单笔确认单编号 | Maybank、HSBC、华泰香港、JPM、SCB、GF |
+| market / execution_venue | string | 通用 | 市场与执行场所 | HSBC、JPM、华泰香港、GF |
+| source_type / source_ref | string | 通用 | 正文还是附件，以及定位信息 | 全部 |
+| isin | string | 扩展 | ISIN 代码 | JPM、华泰香港、GF、SCB |
+| share_class | string | 扩展 | 'A' / H SHS / SHARES-H- | HSBC、SCB、华泰香港 |
+| sedol / broker_security_no | string | 扩展 | SEDOL 与券商内部编号 | GF、华泰香港、JPM、SCB |
+| fill_detail_json / fill_count | object/int | 扩展 | 分批成交明细与笔数（GF 样本各 40 档 / 36 档） | GF 香港 |
+| settle_currency / settlement_amount / exchange_rate | string/number | 扩展 | 非成交币种结算与汇率 | Maybank（MYR→USD） |
+| cash_amount_signed | number | 扩展 | 带符号发生金额 | 华泰 A 股交割单 |
+| settlement_account_no | string | 扩展 | 资金/结算子账号 | JPM、HSBC、SCB |
+| shareholder_account_no | string | 扩展 | 股东账号 | 华泰 A 股交割单 |
+| portfolio_no | string | 扩展 | Customer Portfolio | SCB |
+| trade_time / trade_timezone / trade_at_utc | string | 扩展 | 成交时间及其时区（统一换算 UTC） | 华泰香港、JPM、SCB |
+| trading_channel | enum | 扩展 | STOCK_CONNECT / LOCAL | 华泰香港、JPM |
+| doc_type / doc_version / is_preliminary / is_amendment | enum/string/bool | 扩展 | 单据类型与版本状态 | Maybank、华泰香港、JPM |
+| invoice_no | string | 扩展 | Tax Invoice No | JPM |
+| order_no | string | 扩展 | 委托编号 / 成交编号 | 华泰 A 股交割单 |
+| extra_json | object | 扩展 | 品种专属字段（定存的到期日/利率/本金/利息） | SCB |
+
+> 说明：README 第 5 条列出的"数据项清单"仍为空。上表已按 12 份样本收敛为可落库的字段集，因此 §18 Q1 的问题从"要抽哪些字段"变成"要往 Odoo 推哪些字段"（见 Q2）。
 
 ### 9.2 规范化规则
 
-- 股票代码统一大写、去空格；保留市场后缀（如 `0700.HK`）。
-- 日期统一为 ISO `YYYY-MM-DD`（无年份时结合邮件接收时间补全）。
-- 数字去千分位与货币符号；负数与括号表示统一转为带符号数。
-- 币种映射为 ISO 代码（`HK$→HKD`、`US$→USD`、`RMB/￥→CNY`）。
-- 方向映射：`B/买/买入/Buy/Purchase→BUY`，`S/卖/卖出/Sell/Sale→SELL`，其余 `OTHER`。
+- **代码**：统一大写、去空格；A 股补 `.SH`/`.SZ`，港股补 `.HK`；名称尾部的代码（`... CORP H SHS 386`、`(002270)`、`PETROCHINA CO LTD (0857) SHARES-H-`）剥离到 `symbol_name`，原文保留在 `symbol_name_raw`。
+- **日期**：样本中出现 `25-Feb-26`、`28JUL2025`、`8/26/2026`、`8 April 2026`、`01 Sep 2026` 五种写法，统一为 ISO `YYYY-MM-DD`；两位年份按 `YY≤当年后两位+1` 判定为 20YY。
+- **时间**：`14:56 (Asia/Hong_Kong)`、`08:51:00 CET`、`16:49:16` 提取为 `trade_time` + `trade_timezone`，并换算 `trade_at_utc`；无时区标注时按配置的默认时区处理。
+- **数字**：去千分位与货币符号；`(123.45)` 与 `-123.45` 均取负。
+- **币种**：映射为 ISO 代码（`HK$→HKD`、`US$→USD`、`RMB/￥/人民币→CNY`）；**CNH（离岸人民币）不得合并为 CNY**，两者汇率与账户不同，JPM 样本即使用 CNH。
+- **方向**：`B/买/买入/Buy/BOUGHT/Purchase→BUY`，`S/卖/卖出/Sell/SOLD/Sale→SELL`，其余 `OTHER`；原文存入 `side_raw`。
+- **符号**：`quantity` 与 `fees_total` 恒为非负；交割单里的负数量（华泰 A 股 `-327,100`）按 `side` 归一化；`cash_amount_signed` 保留原始符号，买入为负。
+- **金额口径**：`gross_amount` 取"成交金额/Consideration/Proceeds"，`net_amount` 取扣费后的结算净额，两者都不带符号，方向由 `settlement_direction` 表达。
+- **费用**：`commission`、`stamp_duty` 两列按语义归并（含 `Brokerage Fee`、`Broker Fee`、`佣金`），其余名目（`Clearing Fee`、`Transaction Levy`、`Trading Fee`、`F R C Levy`、`Transfer Fee`、`Handling Fee`、`Securities Management Fee`、`Administration Fee`、`过户费`）原样保留在 `fee_detail_json` 的键里，避免为 12 份样本里只出现一两次的名目建列。
+- **忽略行**：交割单中的 `汇总` 行、GF 的 `Total: ... (Average)` 行、HSBC 的 `OPENING/CLOSING LEDGER BALANCE` 行只作为校验依据或 `extra_json` 内容，不得单独生成交易记录。
 
 ### 9.3 校验规则
 
 | 编号 | 规则 | 失败处理 |
 | --- | --- | --- |
-| V1 | `quantity > 0`、`price >= 0` | 复核 |
-| V2 | 三者齐全时 `abs(quantity*price - gross_amount) <= max(0.01, 0.5% * gross_amount)` | 复核 |
-| V3 | `net_amount` 齐全时 `abs(gross_amount ± fee ± tax - net_amount)` 在容差内 | 复核 |
+| V1 | `quantity > 0`、`avg_price >= 0` | 复核 |
+| V2 | 三者齐全时 `abs(quantity*avg_price - gross_amount) <= max(0.01, 0.5% * gross_amount)`；`fill_detail_json` 存在时改为逐档累加校验（GF 样本逐档累加与单据金额完全一致，用"总数量×单据均价"则有 0.8 元级舍入差，约 0.000007%，远小于容差） | 复核 |
+| V3 | 买入 `gross_amount + fees_total ≈ net_amount`；卖出 `gross_amount - fees_total ≈ net_amount` | 复核 |
 | V4 | `trade_date` 不早于邮件接收时间 90 天、不晚于接收时间 +1 天 | 复核 |
-| V5 | `currency` 在配置的白名单内 | 复核 |
+| V5 | `trade_currency` 与 `settle_currency` 均在配置的白名单内（`CNY`、`CNH`、`HKD`、`USD`、`MYR` 等） | 复核 |
 | V6 | `symbol` 非空且符合可配置的代码正则 | 复核 |
 | V7 | `side != OTHER` | 复核 |
-| V8 | 邮件内与跨附件的重复交易去重后仅保留一笔 | 自动 |
+| V8 | 邮件内与跨附件的重复交易去重后仅保留一笔（按 `dedupe_key`） | 自动 |
 | V9 | `confidence < LLM_CONFIDENCE_THRESHOLD`（默认 0.8） | 复核 |
+| V10 | `fill_detail_json` 非空时：`sum(quantity) == quantity` 且加权均价与 `avg_price` 偏差 ≤ 0.5% | 复核 |
+| V11 | `settle_currency != trade_currency` 时必须给出 `exchange_rate`，且 `settlement_amount ≈ net_amount × exchange_rate`（容差 1%，样本 Maybank 汇率 6 位小数） | 复核 |
+| V12 | `activity_type != EQUITY_TRADE` 的记录默认不推送交易表，按配置转入对应处理分支或仅归档 | 按配置 |
+| V13 | `activity_type = DEPOSIT_ROLLOVER` 时 `extra_json` 必须含 `maturity_date`、`interest_rate`、`rolled_principal` | 复核 |
+| V14 | 同一 `dedupe_key` 已存在且已推送成功时，视为同一笔交易的重复通知，执行更新而非新增 | 自动 |
+| V15 | `is_amendment = true` 或 `doc_version` 递增时，用相同 `dedupe_key` 覆盖旧记录并在 `email_events` 留痕 | 自动 |
+| V16 | `is_preliminary = true`（Maybank "Subject to final contract"）的记录允许推送，但打标并在同 `dedupe_key` 的正式单据到达时更新 | 自动 |
 
 所有校验实现为无副作用纯函数，便于单元测试，也便于 API 提供"试算/预校验"能力。
 
@@ -520,11 +671,30 @@ Microsoft Graph 的消息 `id` 在邮件被移动/复制后可能变化，不适
 
 ### 10.2 幂等键
 
+样本显示各家的"单据编号"粒度和名称都不一致，因此用两个键分工：
+
 ```
-external_ref = sha256(f"{issuer_name}|{order_no or ''}|{symbol}|{trade_date}|{side}|{quantity}|{price}")[:32]
+# 单据级幂等键：能取到机构自己的编号就用它（审计与防止重复推送）
+external_ref = sha256(f"{issuer_name}|{account_no}|{broker_ref or order_no or statement_ref}")[:32]
+
+# 业务指纹：跨单据判断"是否为同一笔交易"（成交回报 vs 月结单、正式版 vs Preliminary 版）
+dedupe_key   = sha256(f"{issuer_name}|{account_no}|{settlement_account_no or ''}|"
+                      f"{trade_date}|{symbol}|{side}|{quantity}|{avg_price}|{gross_amount}")[:32]
 ```
 
-优先使用券商/银行提供的成交编号（`order_no`）；缺失时退化为业务字段组合哈希。`external_ref` 写入 Odoo 目标的唯一字段（如 `x_external_ref`），推送前先 `search_read` 判定存在性。若同一笔交易由两封不同邮件通知（例如"成交回报" + "月结单"），业务字段一致时会被识别为同一笔，只更新不新增。
+各家的编号字段对应关系（详见附录 C）：
+
+| 机构 | 单笔编号 `broker_ref` | 文件级编号 `statement_ref` | 备注 |
+| --- | --- | --- | --- |
+| Maybank | `Ref: 00005525071CASG1v1` | `Our Ref: BUC00686157` | 编号尾部 `v1/v2` 为修订版本 |
+| HSBC GPB | `REF. NO: 74438-0` | 无 | 现金账部分无编号 |
+| 华泰香港 | `Our Ref: 00000522284CAHK0v1` | `Our Ref: 00026324489ORHK0` | 一封邮件内两个 Ref |
+| JPM | `Ref.: ACT 999937` | 同左 | 与 `Tax Invoice No` 相同 |
+| SCB | `Reference: SCTRSC2609826719` | 同左 | 定存与股票 advice 各自独立编号 |
+| GF 香港 | `Bargain Number: BG20260826000032` | 无 | 一个 PDF 可含多个 Bargain Number |
+| 华泰 A 股 | `order_no`（委托编号） | 无 | 交割单为多行明细，无单笔编号列 |
+
+`external_ref` 写入 Odoo 目标的唯一字段（如 `x_external_ref`），推送前先 `search_read` 判定存在性；`dedupe_key` 在本库唯一，用于跨邮件判重：同一笔交易由"成交回报 + 月结单"两封邮件通知、或 Preliminary 版先到、正式版后到时，只更新既有记录不新增。对同一交易日同代码同方向同数量的两笔独立成交，因 `broker_ref`/`order_no` 不同而不会被误并。
 
 ### 10.3 字段映射（配置驱动）
 
@@ -684,7 +854,7 @@ uv run bank-emails        # 入口由 pyproject 的 [project.scripts] 提供
 1. **单元测试**：解析器（HTML→文本、PDF/XLSX 表格）、规范化与校验纯函数、映射模板渲染、幂等键计算、退避策略。
 2. **契约测试**：LLM 客户端（Mock HTTP，覆盖合法 JSON、非法 JSON、超时、429）、Odoo 客户端（Mock `odoorpc`，覆盖 create/write/唯一冲突/权限错误）。
 3. **集成测试**：SQLite + 状态机 + FastAPI（`TestClient`），覆盖"新邮件→跳过""确认单→推送""校验失败→复核""重试后成功"等路径。
-4. **端到端测试**：用固定 fixtures 邮件（`.eml` 样本，含 PDF/图片/CSV 附件）走完整流水线，LLM 与 Odoo 使用录制回放（VCR 式）。
+4. **端到端测试**：用固定 fixtures 邮件（`.eml` 样本，含 PDF/图片/CSV 附件）走完整流水线，LLM 与 Odoo 使用录制回放（VCR 式）。`docs/examples/` 下的 12 份真实确认单是首批 fixtures，附录 C 中已核算的金额关系直接作为断言。
 5. **评测回归**：Golden Set 批量跑分类与抽取，输出准确率报告并与基线比较，准确率下降则测试失败。
 6. **运行验证**：真实邮箱的只读冒烟测试（手动触发，不上线），确认认证、分页、限流、水位线行为。
 
@@ -723,14 +893,16 @@ uv run bank-emails        # 入口由 pyproject 的 [project.scripts] 提供
 
 | 编号 | 问题 | 影响 |
 | --- | --- | --- |
-| Q1 | README 第 5 条的"数据项清单"为空，最终要抽取哪些字段？ | 决定 JSON Schema 与 Odoo 映射 |
+| Q1 | README 第 5 条的"数据项清单"为空。已按 `docs/examples/` 的 12 份样本整理出 §9.1 字段集，请确认有无遗漏或多余 | 决定 JSON Schema 与 Odoo 映射 |
 | Q2 | 交易数据写入 Odoo 的哪个模型与字段（自定义 `x_*` 模型还是 `account.move` 等）？ | 决定映射配置 |
 | Q3 | M365 认证采用应用认证（client credentials）还是委派认证（refresh token）？ | 决定权限配置与令牌存储方式 |
 | Q4 | LLM 供应商与模型（OpenAI / Azure OpenAI / 自建网关）？是否允许邮件内容出境？ | 决定客户端实现与合规评估 |
 | Q5 | 是否需要留存邮件原文与附件？留存多久？ | 决定存储与清理策略 |
 | Q6 | 低置信度记录人工复核的方式：仅 API，还是需要 CLI/简易页面？ | 决定 M4 范围 |
-| Q7 | 是否需要"同一笔交易被多封邮件通知"的去重（成交回报 + 月结单）？ | 影响幂等键设计 |
+| Q7 | 是否需要"同一笔交易被多封邮件通知"的去重（如 Maybank Preliminary → 正式版、成交回报 + 月结单）？当前按 `dedupe_key` 判重并更新既有记录 | 影响幂等键与 Odoo 更新策略 |
 | Q8 | 目标 Odoo 版本与账号权限（是否允许 create/write）？ | 影响集成可行性 |
+| Q9 | 定存滚存与现金账户流水（SCB、HSBC 样本）是否也要进 Odoo？目标模型是什么？ | 决定 `activity_type` 的处理分支 |
+| Q10 | 华泰 A 股汇总对账单的日期列为"汇总"占位，成交日期能否从邮件主题等处获得？ | 决定该格式能否自动确定 `trade_date`，否则只能进人工复核 |
 
 ---
 
@@ -771,8 +943,175 @@ async def poll_once() -> None:
 ```text
 email.status:            PENDING | FETCHED | PARSED | CLASSIFIED | EXTRACTED
                          | VALIDATED | SKIPPED | PUSHED | FAILED | NEEDS_REVIEW
+doc_type:                CONFIRMATION | ADVICE | DELIVERY_STATEMENT | OTHER
+activity_type:           EQUITY_TRADE | DEPOSIT_ROLLOVER | CASH_MOVEMENT | OTHER
 side:                    BUY | SELL | OTHER
 issuer_type:             broker | bank | other
-push_status:             PENDING | PUSHED | FAILED
+trading_channel:         STOCK_CONNECT | LOCAL
+settlement_direction:    DEBIT | CREDIT
+push_status:             PENDING | VALIDATED | PUSHED | FAILED | NEEDS_REVIEW
 attachment.parse_status: PENDING | OK | SKIPPED | FAILED
 ```
+
+## 附录 C：样本确认单字段对照
+
+本附录来自 `docs/examples/` 下的 12 份真实确认单，是 §7 交易明细表、§8.3 抽取 Schema 与 §9 字段字典的直接依据，同时可作为 Golden Set 的初始样本。
+
+### C.1 样本清单
+
+| 文件 | 机构 | 单据类型 | 页 | 交易笔数 |
+| --- | --- | --- | --- | --- |
+| `Maybank_0114460klsusd_eml_20260225174351.pdf` | Maybank Securities (SG) | Preliminary confirmation | 2 | 1（买入 SOLARVEST, MYR） |
+| `Maybank_0114460klsusd_eml_20260505175106.pdf` | Maybank Securities (SG) | Preliminary confirmation | 2 | 1（卖出 MALAKOFF, MYR） |
+| `Maybank  - 0114460klsusd_eml_20260909175120.pdf` | Maybank Securities (SG) | Preliminary confirmation | 2 | 2（卖出 MAH SING + SOLARVEST） |
+| `HSBC-8088-620351-0001_Trade Confirmation as of 28 July 2025.pdf` | HSBC Global Private Banking | Confirmations / Advices | 4 | 1 股票 + 1 现金账 |
+| `HSBC-8088-624122-0001_Trade Confirmation as of 28 July 2025.pdf` | HSBC Global Private Banking | Confirmations / Advices | 4 | 1 股票 + 1 现金账 |
+| `Huatai_HK_1.pdf` | 华泰金融控股（香港） | Email confirmation（NEW） | 1 | 1（卖出 600887，沪港通） |
+| `JPM_62856134_3839260_2026-09-01.pdf` | J.P. Morgan Private Bank | Confirmation + Tax Invoice | 2 | 1（买入 巨力索具，CNH，深港通） |
+| `JPM_62884986_5179260_2026-09-02.pdf` | J.P. Morgan Private Bank | Confirmation + Tax Invoice | 2 | 1（买入 美团，HKD，HKEX） |
+| `SCB-08-Apr-2026.pdf` | 渣打银行（香港）GPB | 合并 advices | 5 | 1 股票 + 2 笔定存滚存 |
+| `GF-20260826-10821237-BG20260826000033-2026051200000011.pdf` | 广发证券（香港） | Bargain advice ×2 | 4 | 2（华明装备 562,000、江苏神通 860,900） |
+| `OtherAT_Huatai_2026.05.14 中际旭创.pdf` | 华泰证券（A 股） | 按证券汇总的对账单 | 1 | 1（买入 300308，9,400 股） |
+| `OtherAT_Huatai_2026.08.26 江苏神通 & 华明装备.pdf` | 华泰证券（A 股） | 按证券汇总的对账单 | 1 | 2（卖出 002438、002270） |
+
+### C.2 各家原始标签 → 目标列
+
+**Maybank Securities**（成交币种与结算币种不同）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `Our Ref: BUC00686157` | `statement_ref` |
+| `Ref: 00005525071CASG1v1` | `broker_ref`（尾部 `v1/v2` → `doc_version`） |
+| `Account Code: 0114460` / `Account: IKARIA GROUP (HK) LIMITED` | `account_no` / `account_name` |
+| `Trade Date: 25-Feb-26` / `Settlement Date: 27-Feb-26` | `trade_date` / `settle_date` |
+| `We confirm you having BOUGHT / SOLD` | `side` + `side_raw` |
+| `(ISIN. Code: MYQ0215OO002)` | `isin` |
+| `165,000 SOLARVEST HOLDINGS BERHAD at MYR 2.3302` | `quantity` / `symbol_name_raw` / `trade_currency` / `avg_price` |
+| `Proceeds: 384,483.00` | `gross_amount` |
+| `Commission: 480.60` / `Clearing Fee: 115.35` / `Stamp Duty: 385.00` | `commission` / `fee_detail_json` / `stamp_duty` |
+| `TOTAL: 385,463.95` | `net_amount` |
+| `Exchange Rate: 0.257599` | `exchange_rate` |
+| `Settlement Amount: USD 99,295.13` | `settlement_amount` / `settle_currency` |
+| `Preliminary confirmation (Subject to final contract)` | `is_preliminary = true` |
+
+核对：`165,000 × 2.3302 = 384,483.00`；`384,483.00 + 480.60 + 115.35 + 385.00 = 385,463.95`；`385,463.95 × 0.257599 ≈ 99,295.13`。三者与单据一致，可直接用于 §9.3 的 V2/V3/V11 回归用例。
+
+**HSBC Global Private Banking**（一份文件内含现金账与股票两部分）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `ACCOUNT NO. 8088-620351-0001` | `account_no` |
+| `REF. NO: 74438-0` | `broker_ref` |
+| `CASH ACCOUNT ADVICE` + `OPENING/CLOSING LEDGER BALANCE` | `activity_type = CASH_MOVEMENT`，不生成股票交易记录 |
+| `Security Name: CHINA PETROLEUM AND CHEMICAL CORP H SHS 386` | `symbol_name_raw`（`H SHS` → `share_class`，`386` → `symbol = 0386.HK`） |
+| `No. Of Shares: 13,582,000` | `quantity` |
+| `Unit Price: HKD4.521900` | `avg_price` / `trade_currency` |
+| `Consideration: HKD61,416,445.80` | `gross_amount` |
+| `Trade Date: 28JUL2025` / `Settlement: 30JUL2025` | `trade_date` / `settle_date` |
+| `Commission / Stamp Duty / Transaction Levy / Trading Fee / F R C Levy` | `commission` / `stamp_duty` / `fee_detail_json` |
+| `Settlement Amount: HKD61,257,683.75` | `net_amount` |
+| `Market/Exchange: HONG KONG` | `market` / `execution_venue` |
+| `Transaction Basis(B): B` | `extra_json`（非交易字段，仅归档） |
+
+**华泰金融控股（香港）**（Stock Connect，含成交时间与时区）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `This is a NEW confirmation` | `is_amendment = true` |
+| `Our Ref: 00026324489ORHK0` / `Our Ref: 00000522284CAHK0v1` | `statement_ref` / `broker_ref` + `doc_version` |
+| `Account: _IKARIA_SK`（Non-breakdown Account） | `account_no` |
+| `We have SOLD for you as AGENT` | `side = SELL` / `side_raw` |
+| `500,000 shares in I/MONGOLIA YILI IN 'A'CNY1 at a gross price of CNY 27.1436` | `quantity` / `symbol_name_raw` + `share_class = 'A'` / `avg_price` / `trade_currency` |
+| `Traded on 22 Jul 2026 at 14:56 (Asia/Hong_Kong)` | `trade_date` / `trade_time` / `trade_timezone` / `trade_at_utc` |
+| `under the rules of the Shanghai-Hong Kong Stock Connect` | `trading_channel = STOCK_CONNECT` |
+| `Settlement due on 22 Jul 2026` | `settle_date` |
+| `Gross Consideration: CNY 13,571,800.00` | `gross_amount` |
+| `Administration Fee / Commission / Handling Fee / Stamp Duty / Transfer Fee` | `fee_detail_json`（`commission`、`stamp_duty` 另单列） |
+| `Net Consideration: CNY 13,554,372.45` | `net_amount` |
+| `Local Code: 600887` / `ISIN Code` / `SEDOL Code` | `symbol = 600887.SH` / `isin` / `sedol` |
+| `settling in CNY` | `settle_currency` |
+
+核对：`500,000 × 27.1436 = 13,571,800.00`；五项费用合计 `17,427.55`；`13,571,800.00 − 17,427.55 = 13,554,372.45`，与 `Net Consideration` 一致。
+
+**J.P. Morgan Private Bank**（自带 Tax Invoice 号、成交时间带时区、结算子账号）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `Tax Invoice No: ACT 999937` / `Ref.: ACT 999937` | `invoice_no` / `broker_ref` |
+| `Account No.: 3839260/000` | `account_no` |
+| `PURCHASE SPOT - SHARES` | `activity_type = EQUITY_TRADE` / `side_raw` |
+| `Trade date / time (CET): 01 Sep 2026 08:51:00` | `trade_date` / `trade_time` / `trade_timezone = CET` |
+| `Value date: 01 Sep 2026` | `settle_date` |
+| `Security Name` / `ISIN number` / `Security Number: 8018673-000` | `symbol_name_raw` / `isin` / `broker_security_no` |
+| `Price 20.6448 CNH` / `Quantity 235,600` | `avg_price` / `trade_currency` / `quantity` |
+| `Gross amount` | `gross_amount` |
+| `Brokerage Fee / Transfer fee / Security management fee / Handling fee / Commission` | `fee_detail_json`（`commission` 单列） |
+| `Net amount` | `net_amount` |
+| `By the debit of your account 3839260/011.000.CNH` | `settlement_account_no` / `settlement_direction = DEBIT` / `settle_currency = CNH` |
+| `Execution Venue: SHENZHEN - HK STOCK CONNECT` | `execution_venue` / `trading_channel` |
+
+核对：`235,600 × 20.6448 = 4,863,914.88`；五项费用合计 `7,704.93`；`4,863,914.88 + 7,704.93 = 4,871,619.81`，与 `Net amount` 一致（买入加费用）。
+
+**渣打银行（香港）Global Private Bank**（合并文件，股票与定存混排，费用含费率）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `Reference: SCTRSC2609826719` | `broker_ref` |
+| `Customer: 513887-1` | `portfolio_no` |
+| `Transaction Advice` / `Time Deposit Rollover Confirmation` | `doc_type` / `activity_type` |
+| `We sold for your account` | `side = SELL` / `side_raw` |
+| `Trade Date: 8 April 2026` / `Value Date: 10 April 2026` / `At 16:49:16` | `trade_date` / `settle_date` / `trade_time` |
+| `2,000,000 at 10.5331` + `Currency HKD` + `Amount 21,066,200.00` | `quantity` / `avg_price` / `trade_currency` / `gross_amount` |
+| `Transaction levy / Trading fee / Commission / Broker Fee / Stamp duty` | `fee_detail_json`（`commission`、`stamp_duty` 单列） |
+| `*Rate of Commission ( 0.10 % )` | `commission_rate = 0.001` |
+| `Net amount` / `Amount credited to your account 8522657875` | `net_amount` / `settlement_account_no` / `settlement_direction = CREDIT` |
+| `200149-000 / CNE1000003W8 / PETROCHINA CO LTD (0857) SHARES-H-` | `broker_security_no` / `isin` / `symbol_name_raw`（`0857` → `symbol = 0857.HK`，`SHARES-H-` → `share_class`） |
+| 定存块：`Rolled principal` / `Plus interest amount` / `Total at 9 April 2026` / `Interest Rate` / `Value` / `Maturity` | `extra_json`（`rolled_principal`、`interest_amount`、`maturity_date`、`interest_rate`），`settlement_amount` 记 Total |
+
+核对：`2,000,000 × 10.5331 = 21,066,200.00`；费用合计 `48,137.07`；`21,066,200.00 − 48,137.07 = 21,018,062.93`，与 `Net amount` 一致。
+
+**广发证券（香港）**（同一 PDF 多份 Bargain advice，分价成交明细）
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `Bargain Number: BG20260826000032 / ...33` | `broker_ref`（一份 PDF 内两个） |
+| `Client Account Number: 10821237-10821237` | `account_no` |
+| `Trade Date: 8/26/2026` / `Settlement Date: 8/27/2026` | `trade_date` / `settle_date` |
+| `Trade Type: BOUGHT` | `side = BUY` / `side_raw` |
+| `Instrument Name: HUAMING POWER EQUIPMENT(002270)` | `symbol_name_raw` → `symbol = 002270.SZ` |
+| `ISIN Code` / `SEDOL` | `isin` / `sedol` |
+| 40 行（华明装备）/ 36 行（江苏神通）的 `Quantity` + `Gross Price`，以及 `Total: 562,000 / 860,900 ...(Average)` | `fill_detail_json` / `fill_count` / `quantity` / `avg_price` |
+| `Consideration` | `gross_amount` |
+| `Commission / Handling Fee / Securities Management Fee / Transfer Fee` | `commission` / `fee_detail_json` |
+| `Settlement Amount (CNY)` | `net_amount` / `trade_currency` |
+
+核对：两笔按 `fill_detail` 逐档 `数量×价格` 累加分别为 `10,899,953.00` 与 `12,017,390.00`，与单据 `Consideration` **完全一致**；若用"总数量 × 单据均价"反推则有 0.8 元级舍入差（约 0.000007%）。因此分价成交明细必须整段保留。
+
+**华泰证券（A 股）按证券汇总的对账单**
+
+| 原始标签 | 目标列 |
+| --- | --- |
+| `资产账号 666631992736` / `股东账号 0284116724` | `account_no` / `shareholder_account_no` |
+| `证券代码 300308 / 002438 / 002270` + `证券名称 中际旭创 / 江苏神通 / 华明装备` | `symbol`（补 `.SZ`）/ `symbol_name` |
+| `业务标志 证券买入 / 证券卖出` + `操作 买 / 卖` | `side_raw` / `side` |
+| `币种 人民币` | `trade_currency = CNY` |
+| `发生数量`（卖出行为负数，如 `-327,100`） | `quantity`（取绝对值归一） |
+| `发生金额`（带符号，如 `-9,921,541.03`） | `cash_amount_signed` |
+| `成交均价` / `成交金额` | `avg_price` / `gross_amount` |
+| `佣金` / `印花税` / `过户费` | `commission` / `stamp_duty` / `fee_detail_json`（键为 `过户费`） |
+| `应付金额`（与 `发生金额` 同值、带符号） | `net_amount`（取绝对值）+ `settlement_direction` |
+| `交割日期` / `委托编号` | `settle_date` / `order_no` |
+| `资金余额 / 回购利息 / 到期日 / 资金可用日 / 资金可取日 / 计息天数 / 实际占用天数 / 备注` | `extra_json`（非交易字段，仅归档） |
+| 字面值为 `汇总` 的单元格（日期、交割日期、委托编号等） | 对应列置空，不得把 `汇总` 写进任何数值或日期列 |
+
+核对：中际旭创 `9,400 × 1,055.351 = 9,920,299.40`，与单据 `成交金额 9,920,297.00` 相差 2.40 元（成交均价四舍五入所致，误差 0.000024%）；`9,920,297.00 + 1,144.82 + 99.21 = 9,921,541.03`，与 `应付金额` 完全一致。
+
+### C.3 从样本得出的建模结论
+
+1. **费用名目因机构而异，且不可穷举**：12 份样本共出现 14 种费用名目，除 `Commission / 佣金` 与 `Stamp Duty / 印花税` 外都只出现 1–3 次，因此只保留这两列通用项，其余名目全部进 `fee_detail_json`。
+2. **必须区分交易币种与结算币种**：Maybank 以 MYR 成交、USD 结算并给出汇率；JPM 以 CNH 成交并标注结算子账户。合并成单个 `currency` 列会丢失结算信息。
+3. **一封邮件可能包含多个品种、多份 advice，甚至非股票业务**：SCB 的 5 页里混有 2 笔定存滚存，HSBC 的 4 页里混有现金账户收支。`activity_type` 与 `doc_type` 是防止把定存/现金流水当成股票成交推送进 Odoo 的关键开关。
+4. **同一机构存在多种单据形态**：Maybank 明确标注 `Preliminary confirmation (Subject to final contract)`，华泰香港标注 `NEW confirmation` 且编号带版本后缀，二者都会造成"同一笔交易被通知多次"，因此 `dedupe_key`（业务指纹）与 `external_ref`（单据编号）必须分开。
+5. **成交时间与时区只在部分机构出现**：华泰香港给出 `Asia/Hong_Kong`、JPM 给出 `CET`、SCB 只给时分秒。统一换算 `trade_at_utc` 才能跨机构排序与判重。
+6. **标的标识最多有 4 套编码**：本地代码、ISIN、SEDOL、券商内部编号。样本中同一支股票（如中石油 H）在不同机构分别写作 `386`、`0857`、`200149-000`、`CNE1000003W8`，仅靠 `symbol` 关联并不安全，`isin` 才是跨机构主键。
+7. **数字格式差异大**：千分位、4–6 位小数价格、负号表方向、`汇总` 占位混在同一张表里。解析层必须先规范化，再交给校验层判定。
