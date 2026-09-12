@@ -7,7 +7,11 @@ authors = [
     { name = "alai04", email = "alai04@gmail.com" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "fastapi>=0.141.1",
+    "pydantic-settings>=2.15.0",
+    "uvicorn>=0.52.4",
+]
 
 [project.scripts]
 bank-emails = "bank_emails:main"
@@ -15,3 +19,14 @@ bank-emails = "bank_emails:main"
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
