@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# 真实交易确认单样本（含客户名称、账号、成交金额，不纳入版本控制）
+/docs/examples/
