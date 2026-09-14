@@ -7,7 +7,10 @@ from typing import Callable
 
 from fastapi.testclient import TestClient
 
+from bank_emails.api import create_app
+from bank_emails.config import Settings
 from bank_emails.store import Store
+from bank_emails.sync import SyncAlreadyRunning, SyncResult
 
 
 def test_healthz_needs_no_token(client: TestClient) -> None:
@@ -314,3 +317,49 @@ def test_not_implemented_endpoints_are_explicit(
         response = getattr(client, method)(path, headers=auth_headers)
         assert response.status_code == 501, path
         assert response.json()["error"]["code"] == "NOT_IMPLEMENTED", path
+
+
+class FakeSyncService:
+    def __init__(self, *, busy: bool = False) -> None:
+        self.busy = busy
+        self.calls = 0
+
+    async def run_once(self) -> SyncResult:
+        self.calls += 1
+        if self.busy:
+            raise SyncAlreadyRunning("a mail fetch is already running")
+        return SyncResult(
+            fetched=3,
+            stored=2,
+            duplicates=1,
+            parsed=2,
+            watermark="2026-09-12T01:00:00Z",
+        )
+
+
+def test_manual_fetch_returns_sync_result(
+    settings: Settings,
+    store: Store,
+    auth_headers: dict[str, str],
+) -> None:
+    service = FakeSyncService()
+    with TestClient(create_app(settings, store, sync_service=service)) as client:  # type: ignore[arg-type]
+        response = client.post("/api/v1/jobs/fetch", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["fetched"] == 3
+    assert response.json()["watermark"] == "2026-09-12T01:00:00Z"
+    assert service.calls == 1
+
+
+def test_manual_fetch_conflicts_when_already_running(
+    settings: Settings,
+    store: Store,
+    auth_headers: dict[str, str],
+) -> None:
+    service = FakeSyncService(busy=True)
+    with TestClient(create_app(settings, store, sync_service=service)) as client:  # type: ignore[arg-type]
+        response = client.post("/api/v1/jobs/fetch", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "FETCH_ALREADY_RUNNING"

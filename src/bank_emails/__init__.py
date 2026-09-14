@@ -13,12 +13,14 @@ import sys
 from .api import VERSION, create_app, run
 from .config import ConfigError, Settings, load_settings
 from .db import init_db, open_database
+from .lock import LockUnavailable, SingleInstanceLock
 from .store import Store
 
 __version__ = VERSION
 
 __all__ = [
     "ConfigError",
+    "LockUnavailable",
     "Settings",
     "Store",
     "__version__",
@@ -68,7 +70,16 @@ def main(argv: list[str] | None = None) -> None:
         connection.close()
         return
 
+    lock = SingleInstanceLock(settings.data_dir / "bank_emails.lock")
+    try:
+        lock.acquire()
+    except LockUnavailable as exc:
+        print(f"启动失败：{exc}", file=sys.stderr)
+        connection.close()
+        raise SystemExit(1) from exc
+
     try:
         run(settings, store)
     finally:
         connection.close()
+        lock.release()

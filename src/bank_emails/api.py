@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets as secrets_module
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
@@ -18,9 +20,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .config import Settings
+from .mail import O365MailClient
 from .store import EMAIL_STATUSES, PUSH_STATUSES, REVIEW_STATUSES, Store
+from .sync import MailSyncService, SyncAlreadyRunning
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 IN_FLIGHT_STATUSES: tuple[str, ...] = (
     "PENDING",
@@ -48,15 +52,43 @@ def _error_body(code: str, message: str, trace_id: str | None) -> dict[str, Any]
     return {"error": {"code": code, "message": message, "trace_id": trace_id}}
 
 
-def create_app(settings: Settings, store: Store) -> FastAPI:
+def create_app(
+    settings: Settings,
+    store: Store,
+    *,
+    sync_service: MailSyncService | None = None,
+    start_sync: bool = False,
+) -> FastAPI:
     """构造 FastAPI 应用。配置与数据访问对象通过 `app.state` 注入，便于测试。"""
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):  # type: ignore[no-untyped-def]
+        task: asyncio.Task[None] | None = None
+        if start_sync and sync_service:
+            task = asyncio.create_task(sync_service.run_forever())
+        try:
+            yield
+        finally:
+            if task:
+                sync_service.stop()
+                try:
+                    await asyncio.wait_for(task, timeout=30)
+                except asyncio.TimeoutError:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
     app = FastAPI(
         title="bank-emails",
         version=VERSION,
         description="交易确认单邮件处理 daemon 的状态与统计接口",
+        lifespan=lifespan,
     )
     app.state.settings = settings
     app.state.store = store
+    app.state.sync_service = sync_service
     app.state.started_at = _now_iso()
 
     _register_trace_id(app)
@@ -67,8 +99,13 @@ def create_app(settings: Settings, store: Store) -> FastAPI:
 
 def run(settings: Settings, store: Store) -> None:  # pragma: no cover - 由入口调用
     """以当前配置启动 API 服务。"""
+    sync_service = MailSyncService(
+        settings,
+        store,
+        client=O365MailClient(settings),
+    )
     uvicorn.run(
-        create_app(settings, store),
+        create_app(settings, store, sync_service=sync_service, start_sync=True),
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
@@ -292,9 +329,16 @@ def _build_router() -> APIRouter:
     def resolve_review(item_id: int) -> dict[str, Any]:
         raise ApiError(501, "NOT_IMPLEMENTED", f"人工修正 {item_id} 尚未实现")
 
-    @api.post("/jobs/fetch", tags=["jobs"], status_code=501)
-    def trigger_fetch() -> dict[str, Any]:
-        raise ApiError(501, "NOT_IMPLEMENTED", "手动触发拉取依赖邮件采集模块，尚未实现")
+    @api.post("/jobs/fetch", tags=["jobs"])
+    async def trigger_fetch(request: Request) -> dict[str, Any]:
+        sync_service: MailSyncService | None = request.app.state.sync_service
+        if not sync_service:
+            raise ApiError(501, "NOT_IMPLEMENTED", "当前应用未配置邮件采集服务")
+        try:
+            result = await sync_service.run_once()
+        except SyncAlreadyRunning as exc:
+            raise ApiError(409, "FETCH_ALREADY_RUNNING", str(exc)) from exc
+        return result.as_dict()
 
     router.include_router(api)
     return router

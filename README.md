@@ -6,24 +6,26 @@
 
 设计与字段口径见 [docs/product-design.md](docs/product-design.md)。
 
-当前版本 v0.1.0（里程碑 M0）。
+当前版本 v0.2.0（里程碑 M1）。
 
 ## 当前进度
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| M0 | 配置管理、数据库表结构、REST API 骨架 | 已完成 |
-| M1 | M365 认证、增量拉取、附件下载与解析 | 待开发 |
-| M2 | LLM 分类与抽取、校验、置信度 | 待开发 |
+| M0 | 配置管理、数据库表结构、单实例锁、REST API 骨架 | 已完成 |
+| M1 | M365 认证、增量拉取、附件下载与解析 | 已完成 |
+| M2 | LLM 分类与抽取、校验、置信度 | 下一步 |
 | M3 | Odoo 推送（幂等 upsert） | 待开发 |
 | M4 | 人工复核、告警、部署脚本 | 待开发 |
 
-因此当前版本的 REST API 读写能力如下：查询类接口可用；`重新处理 / 推送 / 手动拉取` 等
-依赖后台流水线的接口已固定路径，但返回 `501 NOT_IMPLEMENTED`。
+因此当前版本的查询类接口可用，`/api/v1/jobs/fetch` 已能同步执行一轮邮件拉取；
+`重新处理 / 推送 / 人工修正` 等依赖后续流水线的接口仍返回 `501 NOT_IMPLEMENTED`。
 
 ## 环境要求
 
 - Python ≥ 3.10（仓库用 [uv](https://docs.astral.sh/uv/) 管理虚拟环境与依赖）
+- Microsoft 365 邮件访问使用 `python-o365` 2.x（`O365` 包），项目不自行实现 Graph 客户端
+- PDF 文本层解析依赖 Poppler 提供的 `pdftotext` 命令（macOS 可执行 `brew install poppler`）
 - 一个可读取的 Microsoft 365 邮箱（应用认证或委派认证）
 - 一个 OpenAI 兼容的 LLM 端点
 - 一个可写入的 Odoo 服务
@@ -92,7 +94,7 @@ uv run bank-emails --check-config                     # 只做配置与建库自
 | POST | `/api/v1/transactions/{transaction_id}/push` | 手动重试推送（501，待 Odoo 客户端接入） |
 | GET | `/api/v1/review` | 人工复核队列（邮件级失败 + 交易级推送失败） |
 | POST | `/api/v1/review/{item_id}` | 提交人工修正（501，待流水线接入） |
-| POST | `/api/v1/jobs/fetch` | 手动触发一次拉取（501，待邮件采集接入） |
+| POST | `/api/v1/jobs/fetch` | 手动触发一次拉取与解析；并发调用返回 409 |
 
 调用示例：
 
@@ -143,7 +145,11 @@ src/bank_emails/
   __init__.py   入口：加载配置 → 建库 → 启动 API（含 --check-config）
   config.py     配置模型、校验与脱敏
   db.py         建表 SQL、SQLite 连接与 PRAGMA
+  mail.py       python-o365 认证、增量邮件与附件读取
+  lock.py       单实例文件锁
+  parser.py     正文、PDF、CSV、XLSX、DOCX 文本解析
   store.py      数据访问层（SQL 只出现在这里）
+  sync.py       拉取、落库、解析与水位线编排
   api.py        FastAPI 应用与路由
 tests/          pytest 测试
 docs/           产品设计文档与样本（docs/examples 为真实单据，不入库）

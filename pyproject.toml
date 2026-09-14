@@ -1,13 +1,14 @@
 [project]
 name = "bank-emails"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Microsoft 365 mail confirmation processing daemon"
 readme = "README.md"
 authors = [
     { name = "alai04", email = "alai04@gmail.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [
+    "O365>=2.1.9,<3",
     "fastapi>=0.141.1",
     "pydantic-settings>=2.15.0",
     "uvicorn>=0.52.4",

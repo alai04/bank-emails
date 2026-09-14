@@ -110,6 +110,18 @@ class Store:
             )
             self.connection.commit()
 
+    def _set_runtime_states(self, values: dict[str, str | None]) -> None:
+        now = utcnow_iso()
+        with self.write_lock:
+            self.connection.executemany(
+                """
+                INSERT INTO runtime_state (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                ((key, value, now) for key, value in values.items()),
+            )
+            self.connection.commit()
+
     def check_health(self) -> dict[str, Any]:
         """就绪探针使用：能否查询、能否写入。"""
         result: dict[str, Any] = {"db_ok": False, "writable": False, "tables": 0}
@@ -327,6 +339,151 @@ class Store:
             "SELECT * FROM attachments WHERE email_id = ? AND id = ?", (email_id, attachment_id)
         ).fetchone()
         return _decode(row) if row else None
+
+    def upsert_fetched_email(
+        self,
+        *,
+        mailbox: str,
+        internet_message_id: str,
+        graph_id: str,
+        subject: str,
+        sender_address: str,
+        sender_name: str,
+        received_at: str,
+        folder: str,
+        has_attachments: bool,
+        body_text: str,
+        body_sha256: str,
+    ) -> tuple[int, bool]:
+        """Insert a fetched email once; return ``(email_id, created)``."""
+        with self.write_lock:
+            existing = self.connection.execute(
+                "SELECT id FROM emails WHERE mailbox = ? AND internet_message_id = ?",
+                (mailbox, internet_message_id),
+            ).fetchone()
+            if existing:
+                return int(existing["id"]), False
+
+            now = utcnow_iso()
+            cursor = self.connection.execute(
+                """
+                INSERT INTO emails (
+                    mailbox, internet_message_id, graph_id, subject, sender_address, sender_name,
+                    received_at, folder, has_attachments, body_text, body_sha256, status,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'FETCHED', ?, ?)
+                """,
+                (
+                    mailbox,
+                    internet_message_id,
+                    graph_id,
+                    subject,
+                    sender_address,
+                    sender_name,
+                    received_at,
+                    folder,
+                    int(has_attachments),
+                    body_text,
+                    body_sha256,
+                    now,
+                    now,
+                ),
+            )
+            email_id = int(cursor.lastrowid)
+            self.connection.execute(
+                """
+                INSERT INTO email_events (email_id, stage, from_status, to_status, message, created_at)
+                VALUES (?, 'FETCH', NULL, 'FETCHED', ?, ?)
+                """,
+                (email_id, None, now),
+            )
+            self.connection.commit()
+            return email_id, True
+
+    def replace_attachments(self, email_id: int, attachments: Sequence[dict[str, Any]]) -> None:
+        """Replace attachment metadata and extracted text for a newly fetched email."""
+        with self.write_lock:
+            self.connection.execute("DELETE FROM attachments WHERE email_id = ?", (email_id,))
+            self.connection.executemany(
+                """
+                INSERT INTO attachments (
+                    email_id, filename, content_type, size_bytes, sha256, storage_path,
+                    extracted_text, parse_status, parse_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        email_id,
+                        item.get("filename"),
+                        item.get("content_type"),
+                        item.get("size_bytes"),
+                        item.get("sha256"),
+                        item.get("storage_path"),
+                        item.get("extracted_text"),
+                        item.get("parse_status", "PENDING"),
+                        item.get("parse_error"),
+                    )
+                    for item in attachments
+                ),
+            )
+            self.connection.commit()
+
+    def finish_email_parse(
+        self,
+        email_id: int,
+        *,
+        status: str,
+        body_text: str,
+        body_sha256: str,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"PARSED", "NEEDS_REVIEW"}:
+            raise ValueError(f"invalid post-parse status: {status}")
+        with self.write_lock:
+            current = self.connection.execute(
+                "SELECT status FROM emails WHERE id = ?", (email_id,)
+            ).fetchone()
+            if not current:
+                raise KeyError(f"email {email_id} does not exist")
+            now = utcnow_iso()
+            self.connection.execute(
+                """
+                UPDATE emails
+                SET status = ?, body_text = ?, body_sha256 = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, body_text, body_sha256, error, now, email_id),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO email_events (email_id, stage, from_status, to_status, message, created_at)
+                VALUES (?, 'PARSE', ?, ?, ?, ?)
+                """,
+                (email_id, current["status"], status, error, now),
+            )
+            self.connection.commit()
+
+    def record_sync_success(self, watermark: str | None) -> None:
+        values = {
+            "last_success_at": utcnow_iso(),
+            "last_error": None,
+            "consecutive_failures": "0",
+        }
+        if watermark:
+            values["watermark"] = watermark
+        self._set_runtime_states(values)
+
+    def record_sync_failure(self, error: str) -> int:
+        state = self.runtime_state()
+        failures = int(state.get("consecutive_failures") or 0) + 1
+        self._set_runtime_states(
+            {
+                "last_error": error,
+                "last_failure_at": utcnow_iso(),
+                "consecutive_failures": str(failures),
+            }
+        )
+        return failures
 
     # -------------------------------------------------------------------- 交易
     def list_transactions(
